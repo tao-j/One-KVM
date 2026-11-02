@@ -1,0 +1,135 @@
+name: Fork candidate images
+on:
+  push:
+    branches: [ci/candidate-images]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: fork-candidate-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  frontend:
+    if: github.repository == 'tao-j/One-KVM'
+    runs-on: ubuntu-24.04
+    outputs:
+      revision: ${{ steps.source.outputs.revision }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: source
+        run: echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - working-directory: web
+        run: npm ci && npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candidate-frontend
+          path: web/dist
+          retention-days: 14
+  build:
+    needs: frontend
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-gnu
+            sdk: x86_64
+          - arch: arm64
+            target: aarch64-unknown-linux-gnu
+            sdk: arm64
+    env:
+      ARCH: ${{ matrix.arch }}
+      TARGET: ${{ matrix.target }}
+      REVISION: ${{ needs.frontend.outputs.revision }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-frontend
+          path: web/dist
+      - name: Install packaging tools
+        run: sudo apt-get update && sudo apt-get install -y zstd xz-utils unzip
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Cache media SDK
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: build/cross/Dockerfile.${{ matrix.sdk }}
+          platforms: linux/amd64
+          load: true
+          tags: one-kvm-sdk:local
+          cache-from: type=gha,scope=fork-sdk-${{ matrix.arch }}
+          cache-to: type=gha,scope=fork-sdk-${{ matrix.arch }},mode=max
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .ci-cargo-registry
+            .ci-cargo-git
+            target
+          key: fork-${{ matrix.arch }}-${{ hashFiles('Cargo.lock', 'build/cross/Dockerfile.*') }}-${{ github.sha }}
+          restore-keys: fork-${{ matrix.arch }}-${{ hashFiles('Cargo.lock', 'build/cross/Dockerfile.*') }}-
+      - name: Compile application and package upstream runtime
+        run: bash build/ci/fork-candidate.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: one-kvm-${{ matrix.arch }}-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish tested architecture image
+        run: |
+          docker tag "one-kvm-candidate:$ARCH" "ghcr.io/tao-j/one-kvm:candidate-$REVISION-$ARCH"
+          docker push "ghcr.io/tao-j/one-kvm:candidate-$REVISION-$ARCH"
+      - name: Restore cache ownership
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" target .ci-cargo-registry .ci-cargo-git 2>/dev/null || true
+  publish:
+    needs: [frontend, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    env:
+      REVISION: ${{ needs.frontend.outputs.revision }}
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish multi-architecture manifest
+        run: |
+          image=ghcr.io/tao-j/one-kvm
+          docker buildx imagetools create -t "$image:candidate-$REVISION" \
+            "$image:candidate-$REVISION-amd64" "$image:candidate-$REVISION-arm64"
+          docker buildx imagetools inspect "$image:candidate-$REVISION" | tee manifest.txt
+          docker buildx imagetools inspect --raw "$image:candidate-$REVISION" > manifest.json
+          python3 - <<'PY'
+          import json
+          m=json.load(open('manifest.json'))
+          architectures={i['platform']['architecture'] for i in m['manifests'] if i['platform']['os']=='linux'}
+          assert architectures == {'amd64','arm64'}, architectures
+          PY
+          echo "Pull: \`$image:candidate-$REVISION\`" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candidate-manifest
+          path: manifest.*
+          retention-days: 14
