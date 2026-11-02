@@ -79,6 +79,9 @@ pub struct OtgBackend {
     keyboard_leds_enabled: bool,
     keyboard_state: Mutex<KeyboardReport>,
     mouse_state: Mutex<MouseState>,
+    mouse_recovery_needed: AtomicBool,
+    #[cfg(test)]
+    mouse_write_faults: Mutex<std::collections::VecDeque<std::io::ErrorKind>>,
     macos_drag: bool,
     macos_drag_state: Mutex<super::macos_drag::MacosDrag>,
     led_state: Arc<parking_lot::RwLock<LedState>>,
@@ -95,6 +98,8 @@ pub struct OtgBackend {
 }
 
 const HID_WRITE_TIMEOUT_MS: i32 = 20;
+// Backpressure the sequential controller instead of dropping button edges.
+const MOUSE_WRITE_TIMEOUT_MS: i32 = 100;
 const OTG_RUNTIME_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 impl OtgBackend {
@@ -122,6 +127,9 @@ impl OtgBackend {
             keyboard_leds_enabled: paths.keyboard_leds_enabled,
             keyboard_state: Mutex::new(KeyboardReport::default()),
             mouse_state: Mutex::new(MouseState::default()),
+            mouse_recovery_needed: AtomicBool::new(false),
+            #[cfg(test)]
+            mouse_write_faults: Mutex::new(std::collections::VecDeque::new()),
             macos_drag,
             macos_drag_state: Mutex::new(super::macos_drag::MacosDrag::default()),
             led_state: Arc::new(parking_lot::RwLock::new(LedState::default())),
@@ -164,6 +172,10 @@ impl OtgBackend {
     }
 
     fn mark_online(&self) {
+        // Opening a node or writing a peer endpoint is not recovery proof.
+        if self.mouse_recovery_needed.load(Ordering::Acquire) {
+            return;
+        }
         let was_online = self.online.swap(true, Ordering::Relaxed);
         let mut error = self.last_error.write();
         let cleared_error = error.take().is_some();
@@ -392,6 +404,10 @@ impl OtgBackend {
     }
 
     fn send_keyboard_report(&self, report: &KeyboardReport) -> Result<()> {
+        self.send_keyboard_report_impl(report, false)
+    }
+
+    fn send_keyboard_report_impl(&self, report: &KeyboardReport, reliable: bool) -> Result<()> {
         if self.keyboard_path.is_none() {
             return Ok(());
         }
@@ -401,7 +417,17 @@ impl OtgBackend {
         let mut dev = self.keyboard_dev.lock();
         if let Some(ref mut file) = *dev {
             let data = report.to_bytes();
-            match self.write_with_timeout(file, &data) {
+            match if reliable {
+                match OtgDeviceIo::write_with_timeout(file, &data, MOUSE_WRITE_TIMEOUT_MS) {
+                    Ok(false) => Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Keyboard release timed out",
+                    )),
+                    result => result,
+                }
+            } else {
+                self.write_with_timeout(file, &data)
+            } {
                 Ok(true) => {
                     self.mark_online();
                     self.reset_error_count();
@@ -428,6 +454,115 @@ impl OtgBackend {
         }
     }
 
+    // Success means kernel acceptance, not a guest delivery acknowledgement.
+    fn write_mouse_with_timeout(&self, file: &mut File, data: &[u8]) -> std::io::Result<bool> {
+        #[cfg(test)]
+        if let Some(kind) = self.mouse_write_faults.lock().pop_front() {
+            self.record_error("Mouse report delivery failed", "mouse_write_failed");
+            return Err(kind.into());
+        }
+        let result = OtgDeviceIo::write_with_timeout(file, data, MOUSE_WRITE_TIMEOUT_MS);
+        match result {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                self.record_error(
+                    "Mouse report timed out; delivery not confirmed",
+                    "mouse_write_timeout",
+                );
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Mouse HID report timed out",
+                ))
+            }
+            Err(e) => {
+                self.record_error(format!("Mouse report failed: {e}"), "mouse_write_failed");
+                Err(e)
+            }
+        }
+    }
+
+    fn send_mouse_inner(&self, mouse: &mut MouseState, event: MouseEvent) -> Result<()> {
+        // One lock covers transitions and timed writes, including reset.
+        let buttons = mouse.buttons();
+        let Some(intent) = mouse.apply(&event) else {
+            return Ok(());
+        };
+
+        if self.macos_drag {
+            use super::macos_drag::MouseReport;
+            let mut state = self.macos_drag_state.lock();
+            let extent = self.screen_resolution.read().unwrap_or((1920, 1080));
+            let (buttons, reports) = state.plan(event, buttons, extent);
+            debug_assert_eq!(buttons, mouse.buttons());
+            for report in reports.iter().copied() {
+                match report {
+                    MouseReport::Absolute { buttons, x, y } => {
+                        self.send_mouse_report_absolute(buttons, x, y, 0)?
+                    }
+                    MouseReport::Relative {
+                        buttons,
+                        dx,
+                        dy,
+                        wheel,
+                    } => self.send_mouse_report_relative(buttons, dx, dy, wheel)?,
+                }
+            }
+            return Ok(());
+        }
+
+        // Device availability and dual-interface policy remain OTG-specific.
+        match intent.kind {
+            IntentKind::RelativeMove => self.send_mouse_report_relative(
+                intent.buttons,
+                intent.relative.0,
+                intent.relative.1,
+                0,
+            )?,
+            IntentKind::AbsoluteMove => {
+                let buttons = if self.mouse_rel_path.is_some() {
+                    0
+                } else {
+                    intent.buttons
+                };
+                self.send_mouse_report_absolute(buttons, intent.absolute.0, intent.absolute.1, 0)?;
+            }
+            IntentKind::Buttons | IntentKind::Wheel => {
+                if self.mouse_rel_path.is_some() {
+                    self.send_mouse_report_relative(intent.buttons, 0, 0, intent.wheel)?;
+                } else if self.mouse_abs_path.is_some() {
+                    self.send_mouse_report_absolute(
+                        intent.buttons,
+                        intent.absolute.0,
+                        intent.absolute.1,
+                        intent.wheel,
+                    )?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn recover_mouse(&self, mouse: &mut MouseState) -> Result<()> {
+        // Do not replay old movement/wheel/press after uncertainty. Release both
+        // possible endpoints before admitting new input, even after partial dual
+        // interface delivery. Retain the last committed absolute position.
+        self.mouse_recovery_needed.store(true, Ordering::Release);
+        let (x, y) = mouse.absolute();
+        let relative = self.send_mouse_report_relative(0, 0, 0, 0);
+        let absolute = self.send_mouse_report_absolute(0, x, y, 0);
+        if relative.is_err() || absolute.is_err() {
+            self.record_error("Mouse release recovery incomplete", "mouse_recovery_failed");
+            relative?;
+            absolute?;
+        }
+        mouse.release_buttons();
+        self.macos_drag_state.lock().reset();
+        self.mouse_recovery_needed.store(false, Ordering::Release);
+        self.mark_online();
+        Ok(())
+    }
+
     fn send_mouse_report_relative(&self, buttons: u8, dx: i8, dy: i8, wheel: i8) -> Result<()> {
         if self.mouse_rel_path.is_none() {
             return Ok(());
@@ -438,17 +573,24 @@ impl OtgBackend {
         let mut dev = self.mouse_rel_dev.lock();
         if let Some(ref mut file) = *dev {
             let data = [buttons, dx as u8, dy as u8, wheel as u8];
-            match self.write_with_timeout(file, &data) {
+            match self.write_mouse_with_timeout(file, &data) {
                 Ok(true) => {
                     self.mark_online();
                     self.reset_error_count();
                     trace!("Sent relative mouse report: {:02X?}", data);
                     Ok(())
                 }
-                Ok(false) => Ok(()),
+                Ok(false) => unreachable!("mouse timeout is an error"),
                 Err(e) => self.handle_write_error(
                     &mut dev,
-                    e,
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "Mouse HID remained blocked",
+                        )
+                    } else {
+                        e
+                    },
                     "Failed to write mouse report",
                     "Relative mouse",
                 ),
@@ -479,16 +621,23 @@ impl OtgBackend {
                 (y >> 8) as u8,
                 wheel as u8,
             ];
-            match self.write_with_timeout(file, &data) {
+            match self.write_mouse_with_timeout(file, &data) {
                 Ok(true) => {
                     self.mark_online();
                     self.reset_error_count();
                     Ok(())
                 }
-                Ok(false) => Ok(()),
+                Ok(false) => unreachable!("mouse timeout is an error"),
                 Err(e) => self.handle_write_error(
                     &mut dev,
-                    e,
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "Mouse HID remained blocked",
+                        )
+                    } else {
+                        e
+                    },
                     "Failed to write mouse report",
                     "Absolute mouse",
                 ),
@@ -549,7 +698,9 @@ impl OtgBackend {
 
     fn build_runtime_snapshot(&self) -> HidBackendRuntimeSnapshot {
         let initialized = self.initialized.load(Ordering::Relaxed);
-        let mut online = initialized && self.online.load(Ordering::Relaxed);
+        let mut online = initialized
+            && self.online.load(Ordering::Relaxed)
+            && !self.mouse_recovery_needed.load(Ordering::Acquire);
         let mut error = self.last_error.read().clone();
 
         if initialized && !self.check_devices_exist() {
@@ -862,89 +1013,61 @@ impl HidBackend for OtgBackend {
     }
 
     async fn send_mouse(&self, event: MouseEvent) -> Result<()> {
-        // One lock covers transitions and timed writes, including reset.
-        let mut mouse = self.mouse_state.lock();
-        let buttons = mouse.buttons();
-        let Some(intent) = mouse.apply(&event) else {
-            return Ok(());
-        };
-
-        if self.macos_drag {
-            use super::macos_drag::MouseReport;
-            let mut state = self.macos_drag_state.lock();
-            let extent = self.screen_resolution.read().unwrap_or((1920, 1080));
-            let (buttons, reports) = state.plan(event, buttons, extent);
-            debug_assert_eq!(buttons, mouse.buttons());
-            for report in reports.iter().copied() {
-                match report {
-                    MouseReport::Absolute { buttons, x, y } => {
-                        self.send_mouse_report_absolute(buttons, x, y, 0)?
-                    }
-                    MouseReport::Relative {
-                        buttons,
-                        dx,
-                        dy,
-                        wheel,
-                    } => self.send_mouse_report_relative(buttons, dx, dy, wheel)?,
-                }
-            }
-            return Ok(());
+        let mut committed = self.mouse_state.lock();
+        if self.mouse_recovery_needed.load(Ordering::Acquire) {
+            self.recover_mouse(&mut committed)?;
         }
-
-        // Device availability and dual-interface policy remain OTG-specific.
-        match intent.kind {
-            IntentKind::RelativeMove => self.send_mouse_report_relative(
-                intent.buttons,
-                intent.relative.0,
-                intent.relative.1,
-                0,
-            )?,
-            IntentKind::AbsoluteMove => {
-                let buttons = if self.mouse_rel_path.is_some() {
-                    0
-                } else {
-                    intent.buttons
-                };
-                self.send_mouse_report_absolute(buttons, intent.absolute.0, intent.absolute.1, 0)?;
+        let mut next = committed.clone();
+        match self.send_mouse_inner(&mut next, event) {
+            Ok(()) => {
+                *committed = next;
+                Ok(())
             }
-            IntentKind::Buttons | IntentKind::Wheel => {
-                if self.mouse_rel_path.is_some() {
-                    self.send_mouse_report_relative(intent.buttons, 0, 0, intent.wheel)?;
-                } else if self.mouse_abs_path.is_some() {
-                    self.send_mouse_report_absolute(
-                        intent.buttons,
-                        intent.absolute.0,
-                        intent.absolute.1,
-                        intent.wheel,
-                    )?;
-                }
+            Err(error) => {
+                self.mouse_recovery_needed.store(true, Ordering::Release);
+                self.macos_drag_state.lock().reset();
+                Err(error)
             }
         }
-
-        Ok(())
     }
 
     async fn reset(&self) -> Result<()> {
-        {
+        self.mouse_recovery_needed.store(true, Ordering::Release);
+        let keyboard_result = {
             let mut state = self.keyboard_state.lock();
             state.clear();
-            let report = state.clone();
-            drop(state);
-            self.send_keyboard_report(&report)?;
-        }
-
+            self.send_keyboard_report_impl(&state, true)
+        };
         let mut mouse = self.mouse_state.lock();
-        let release = mouse.release_buttons();
+        self.mouse_recovery_needed.store(true, Ordering::Release);
+        let mut next = mouse.clone();
+        let release = next.release_buttons();
         self.macos_drag_state.lock().reset();
-        self.send_mouse_report_relative(0, 0, 0, 0)?;
-        if self.mouse_rel_path.is_none() && self.mouse_abs_path.is_some() {
-            // An absolute-only release must not teleport the pointer to origin.
-            self.send_mouse_report_absolute(0, release.absolute.0, release.absolute.1, 0)?;
+        let relative_result = self.send_mouse_report_relative(0, 0, 0, 0);
+        let absolute_result = if self.mouse_rel_path.is_none() && self.mouse_abs_path.is_some() {
+            self.send_mouse_report_absolute(0, release.absolute.0, release.absolute.1, 0)
         } else {
-            *mouse = MouseState::default();
-            self.send_mouse_report_absolute(0, 0, 0, 0)?;
+            next = MouseState::default();
+            self.send_mouse_report_absolute(0, 0, 0, 0)
+        };
+        // Always attempt every release, then report failure. A later endpoint's
+        // successful write must not turn a partially failed reset into online.
+        let errors: Vec<String> = [keyboard_result, relative_result, absolute_result]
+            .into_iter()
+            .filter_map(|result| result.err().map(|e| e.to_string()))
+            .collect();
+        if !errors.is_empty() {
+            let reason = format!("HID reset incomplete: {}", errors.join("; "));
+            self.record_error(reason.clone(), "reset_incomplete");
+            return Err(AppError::HidError {
+                backend: "otg".into(),
+                reason,
+                error_code: "reset_incomplete".into(),
+            });
         }
-
+        *mouse = next;
+        self.mouse_recovery_needed.store(false, Ordering::Release);
+        self.mark_online();
         info!("HID state reset");
         Ok(())
     }
@@ -1217,5 +1340,181 @@ mod tests {
         assert!(backend.keyboard_dev.lock().is_none());
         assert!(!backend.initialized.load(Ordering::Relaxed));
         assert!(!backend.online.load(Ordering::Relaxed));
+    }
+    fn fault_backend(absolute: bool) -> (tempfile::NamedTempFile, OtgBackend) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let paths = HidDevicePaths {
+            mouse_absolute: absolute.then(|| file.path().to_path_buf()),
+            mouse_relative: (!absolute).then(|| file.path().to_path_buf()),
+            ..Default::default()
+        };
+        (file, OtgBackend::from_handles(paths).unwrap())
+    }
+
+    #[tokio::test]
+    async fn mouse_timeout_is_error_and_state_is_not_committed() {
+        use crate::hid::MouseButton;
+        for absolute in [false, true] {
+            let (_file, backend) = fault_backend(absolute);
+            backend
+                .mouse_write_faults
+                .lock()
+                .push_back(std::io::ErrorKind::TimedOut);
+            assert!(backend
+                .send_mouse(MouseEvent::button_down(MouseButton::Right))
+                .await
+                .is_err());
+            assert_eq!(backend.mouse_state.lock().buttons(), 0);
+            assert!(backend.mouse_recovery_needed.load(Ordering::Acquire));
+            assert!(!backend.online.load(Ordering::Relaxed));
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_release_requires_neutral_before_new_mouse_input() {
+        use crate::hid::MouseButton;
+        for absolute in [false, true] {
+            let (file, backend) = fault_backend(absolute);
+            backend
+                .send_mouse(MouseEvent::button_down(MouseButton::Right))
+                .await
+                .unwrap();
+            backend
+                .mouse_write_faults
+                .lock()
+                .push_back(std::io::ErrorKind::TimedOut);
+            assert!(backend
+                .send_mouse(MouseEvent::button_up(MouseButton::Right))
+                .await
+                .is_err());
+            assert_eq!(backend.mouse_state.lock().buttons(), 2);
+            backend
+                .send_mouse(MouseEvent::button_down(MouseButton::Left))
+                .await
+                .unwrap();
+            let data = std::fs::read(file.path()).unwrap();
+            let size = if absolute { 6 } else { 4 };
+            assert_eq!(
+                data.chunks_exact(size).map(|r| r[0]).collect::<Vec<_>>(),
+                [2, 0, 1]
+            );
+            assert_eq!(backend.mouse_state.lock().buttons(), 1);
+            assert!(!backend.mouse_recovery_needed.load(Ordering::Acquire));
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_recovery_rejects_press_and_reset_retries_release() {
+        use crate::hid::MouseButton;
+        let (file, backend) = fault_backend(true);
+        backend
+            .send_mouse(MouseEvent::button_down(MouseButton::Right))
+            .await
+            .unwrap();
+        backend
+            .mouse_write_faults
+            .lock()
+            .extend([std::io::ErrorKind::TimedOut; 3]);
+        assert!(backend
+            .send_mouse(MouseEvent::button_up(MouseButton::Right))
+            .await
+            .is_err());
+        assert!(backend
+            .send_mouse(MouseEvent::button_down(MouseButton::Left))
+            .await
+            .is_err());
+        assert!(backend.reset().await.is_err());
+        assert_eq!(std::fs::read(file.path()).unwrap().len(), 6);
+        assert_eq!(backend.mouse_state.lock().buttons(), 2);
+        backend.reset().await.unwrap();
+        assert_eq!(std::fs::read(file.path()).unwrap()[6], 0);
+        assert_eq!(backend.mouse_state.lock().buttons(), 0);
+        assert!(!backend.mouse_recovery_needed.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn keyboard_reset_failure_does_not_skip_mouse_release() {
+        use crate::hid::MouseButton;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let backend = OtgBackend::from_handles(HidDevicePaths {
+            keyboard: Some(file.path().join("missing-keyboard")),
+            mouse_absolute: Some(file.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+        backend
+            .send_mouse(MouseEvent::button_down(MouseButton::Right))
+            .await
+            .unwrap();
+        assert!(backend.reset().await.is_err());
+        assert_eq!(std::fs::read(file.path()).unwrap()[6], 0);
+        assert!(backend.mouse_recovery_needed.load(Ordering::Acquire));
+        assert!(!backend.online.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn failed_position_does_not_replace_last_committed_reset_position() {
+        let (file, backend) = fault_backend(true);
+        backend
+            .send_mouse(MouseEvent::move_abs(100, 200))
+            .await
+            .unwrap();
+        backend
+            .mouse_write_faults
+            .lock()
+            .push_back(std::io::ErrorKind::TimedOut);
+        assert!(backend
+            .send_mouse(MouseEvent::move_abs(300, 400))
+            .await
+            .is_err());
+        backend.reset().await.unwrap();
+        assert_eq!(
+            &std::fs::read(file.path()).unwrap()[6..],
+            &[0, 100, 0, 200, 0, 0]
+        );
+    }
+
+    #[tokio::test]
+    async fn macos_failure_resets_adapter_policy_before_recovery() {
+        use crate::hid::MouseButton;
+        let rel = tempfile::NamedTempFile::new().unwrap();
+        let abs = tempfile::NamedTempFile::new().unwrap();
+        let backend = OtgBackend::with_macos_drag(
+            HidDevicePaths {
+                mouse_relative: Some(rel.path().to_path_buf()),
+                mouse_absolute: Some(abs.path().to_path_buf()),
+                ..Default::default()
+            },
+            true,
+        )
+        .unwrap();
+        backend
+            .send_mouse(MouseEvent::move_abs(100, 200))
+            .await
+            .unwrap();
+        backend
+            .mouse_write_faults
+            .lock()
+            .push_back(std::io::ErrorKind::TimedOut);
+        assert!(backend
+            .send_mouse(MouseEvent::button_down(MouseButton::Right))
+            .await
+            .is_err());
+        assert_eq!(backend.mouse_state.lock().buttons(), 0);
+        backend.reset().await.unwrap();
+        backend
+            .send_mouse(MouseEvent::button_down(MouseButton::Left))
+            .await
+            .unwrap();
+        assert_eq!(backend.mouse_state.lock().buttons(), 1);
+        assert!(!backend.mouse_recovery_needed.load(Ordering::Acquire));
+        assert_eq!(
+            std::fs::read(abs.path())
+                .unwrap()
+                .chunks_exact(6)
+                .last()
+                .unwrap()[0],
+            1
+        );
     }
 }

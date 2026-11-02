@@ -20,7 +20,7 @@ pub(super) struct MouseIntent {
     pub wheel: i8,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(super) struct MouseState {
     buttons: u8,
     absolute: (u16, u16),

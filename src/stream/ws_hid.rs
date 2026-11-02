@@ -10,7 +10,8 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::hid::datachannel::{parse_hid_message, HidChannelEvent};
+use crate::hid::datachannel::parse_hid_message;
+use crate::hid::input_session::HidInputSession;
 use crate::hid::HidController;
 
 pub type ClientId = String;
@@ -130,6 +131,7 @@ impl WsHidHandler {
         mut shutdown_rx: mpsc::Receiver<()>,
     ) {
         let (mut sender, mut receiver) = socket.split();
+        let input = HidInputSession::default();
 
         let status_byte = if self.is_hid_available() {
             0x00u8
@@ -150,8 +152,10 @@ impl WsHidHandler {
                 msg = receiver.next() => {
                     match msg {
                         Some(Ok(Message::Binary(data))) => {
-                            if let Err(e) = self.handle_binary_message(&data, &client).await {
+                            if let Err(e) = self.handle_binary_message(&data, &client, &input).await {
                                 warn!("WsHidHandler: Failed to handle binary message: {}", e);
+                                let _ = sender.send(Message::Binary(vec![0x01].into())).await;
+                                break;
                             }
                         }
                         Some(Ok(Message::Ping(data))) => {
@@ -180,18 +184,18 @@ impl WsHidHandler {
 
         let hid = self.hid_controller.read().clone();
         if let Some(hid) = hid {
-            if let Err(e) = hid.reset().await {
+            if let Err(e) = input.close(hid.as_ref()).await {
                 warn!(
-                    "WsHidHandler: Failed to reset HID on client {} disconnect: {}",
+                    "WsHidHandler: Failed to release owned HID on client {} disconnect: {}",
                     client_id, e
                 );
             } else {
-                debug!("WsHidHandler: HID reset on client {} disconnect", client_id);
+                debug!("WsHidHandler: Owned HID released on client {} disconnect", client_id);
             }
         }
     }
 
-    async fn handle_binary_message(&self, data: &[u8], client: &WsHidClient) -> Result<(), String> {
+    async fn handle_binary_message(&self, data: &[u8], client: &WsHidClient, input: &HidInputSession) -> Result<(), String> {
         let hid = self
             .hid_controller
             .read()
@@ -200,21 +204,7 @@ impl WsHidHandler {
 
         let event = parse_hid_message(data).ok_or("Invalid binary HID message")?;
 
-        match event {
-            HidChannelEvent::Keyboard(kb_event) => {
-                hid.send_keyboard(kb_event)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-            HidChannelEvent::Mouse(ms_event) => {
-                hid.send_mouse(ms_event).await.map_err(|e| e.to_string())?;
-            }
-            HidChannelEvent::Consumer(consumer_event) => {
-                hid.send_consumer(consumer_event)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-        }
+        input.dispatch(hid.as_ref(), event).await.map_err(|e| e.to_string())?;
 
         client.events_processed.fetch_add(1, Ordering::Relaxed);
         self.total_events.fetch_add(1, Ordering::Relaxed);

@@ -2206,24 +2206,32 @@ async function handleWol(mac: string) {
   }
 }
 
-function handleHidError(_error: any, _operation: string) {
+let lastHidErrorAt = 0
+function handleHidError(_error: unknown, _operation: string) {
+  const now = Date.now()
+  if (now - lastHidErrorAt < 2000) return
+  lastHidErrorAt = now
+  toast.error('Input connection unavailable', {
+    description: 'Input was not sent. Reconnect the console before continuing.',
+  })
 }
 
 function sendKeyboardEvent(type: 'down' | 'up', key: CanonicalKey, modifier?: number) {
-  if (videoMode.value !== 'mjpeg' && webrtc.dataChannelReady.value) {
+  if (videoMode.value !== 'mjpeg') {
     const event: HidKeyboardEvent = {
       type: type === 'down' ? 'keydown' : 'keyup',
       key,
       modifier,
     }
     const sent = webrtc.sendKeyboard(event)
-    if (sent) return
+    if (!sent) handleHidError(null, 'keyboard')
+    return // Do not switch transports midway through a gesture.
   }
   hidApi.keyboard(type, key, modifier).catch(err => handleHidError(err, `keyboard ${type}`))
 }
 
 function sendMouseEvent(data: { type: 'move' | 'move_abs' | 'down' | 'up' | 'scroll'; x?: number; y?: number; button?: 'left' | 'right' | 'middle'; scroll?: number }) {
-  if (videoMode.value !== 'mjpeg' && webrtc.dataChannelReady.value) {
+  if (videoMode.value !== 'mjpeg') {
     const event: HidMouseEvent = {
       type: data.type === 'move_abs' ? 'moveabs' : data.type,
       x: data.x,
@@ -2232,7 +2240,8 @@ function sendMouseEvent(data: { type: 'move' | 'move_abs' | 'down' | 'up' | 'scr
       scroll: data.scroll,
     }
     const sent = webrtc.sendMouse(event)
-    if (sent) return
+    if (!sent) handleHidError(null, 'mouse')
+    return // Do not switch transports midway through a gesture.
   }
   hidApi.mouse(data).catch(err => handleHidError(err, `mouse ${data.type}`))
 }

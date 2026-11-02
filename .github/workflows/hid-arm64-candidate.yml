@@ -21,8 +21,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: test/hid-component
+          workspaces: |
+            test/hid-component
+            test/hid-queue
+            test/hid-session
       - run: cargo test --locked --manifest-path test/hid-component/Cargo.toml
+      - run: cargo test --locked --manifest-path test/hid-queue/Cargo.toml
+      - run: cargo test --locked --manifest-path test/hid-session/Cargo.toml
 
   candidate:
     needs: hid-tests
@@ -32,6 +37,9 @@ jobs:
       STOCK_IMAGE: silentwind0/one-kvm@sha256:177818b7e1e72bd6743493e64551d3267341c20cd212b78a1d39a1f38ef32f1d
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
       - name: Make room on the disposable hosted runner
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
@@ -50,6 +58,11 @@ jobs:
             --entrypoint /usr/bin/one-kvm "$STOCK_IMAGE"
           python3 build/ci/copy-stock-frontend.py
           docker rm -f stock-frontend
+      - name: Qualify and patch the stock HID transport assets
+        run: |
+          python3 test/hid-transport/patcher_test.py web/dist
+          python3 build/ci/patch-stock-hid-transport.py web/dist artifacts/hid-frontend-transform.json
+          node test/hid-transport/frontend.test.mjs web/dist/assets/ConsoleView-fkM76oXo-hid-reliable-v1.js web/src/types/hid.ts
       - name: Build cached Debian 12 ARM64 media SDK
         uses: docker/build-push-action@v6
         with:
