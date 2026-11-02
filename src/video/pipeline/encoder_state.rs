@@ -370,7 +370,7 @@ pub(super) fn build_encoder_state(
         })
         .map_err(|e| {
             let detail = if e.is_empty() { ffmpeg_hw_last_error() } else { e };
-            warn!(
+            tracing::warn!(
                 "Hardware JPEG decode unavailable: {}; using libyuv JPEG decode with {} hardware encoding",
                 detail, selected_codec_name
             );
