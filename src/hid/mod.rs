@@ -10,6 +10,7 @@ pub mod datachannel;
 mod factory;
 pub mod keyboard;
 mod macos_drag;
+mod mouse_state;
 #[cfg(unix)]
 pub mod otg;
 #[cfg(unix)]

@@ -19,10 +19,9 @@ use tokio::sync::watch;
 use tracing::{debug, info, trace, warn};
 
 use super::backend::{HidBackend, HidBackendRuntimeSnapshot};
+use super::mouse_state::{IntentKind, MouseState};
 use super::otg_device::OtgDeviceIo;
-use super::types::{
-    ConsumerEvent, KeyEventType, KeyboardEvent, KeyboardReport, MouseEvent, MouseEventType,
-};
+use super::types::{ConsumerEvent, KeyEventType, KeyboardEvent, KeyboardReport, MouseEvent};
 use crate::error::{AppError, Result};
 use crate::events::LedState;
 use crate::otg::{wait_for_hid_devices, HidDevicePaths};
@@ -79,7 +78,7 @@ pub struct OtgBackend {
     consumer_dev: Mutex<Option<File>>,
     keyboard_leds_enabled: bool,
     keyboard_state: Mutex<KeyboardReport>,
-    mouse_buttons: AtomicU8,
+    mouse_state: Mutex<MouseState>,
     macos_drag: bool,
     macos_drag_state: Mutex<super::macos_drag::MacosDrag>,
     led_state: Arc<parking_lot::RwLock<LedState>>,
@@ -122,7 +121,7 @@ impl OtgBackend {
             consumer_dev: Mutex::new(None),
             keyboard_leds_enabled: paths.keyboard_leds_enabled,
             keyboard_state: Mutex::new(KeyboardReport::default()),
-            mouse_buttons: AtomicU8::new(0),
+            mouse_state: Mutex::new(MouseState::default()),
             macos_drag,
             macos_drag_state: Mutex::new(super::macos_drag::MacosDrag::default()),
             led_state: Arc::new(parking_lot::RwLock::new(LedState::default())),
@@ -863,14 +862,19 @@ impl HidBackend for OtgBackend {
     }
 
     async fn send_mouse(&self, event: MouseEvent) -> Result<()> {
-        let buttons = self.mouse_buttons.load(Ordering::Relaxed);
+        // One lock covers transitions and timed writes, including reset.
+        let mut mouse = self.mouse_state.lock();
+        let buttons = mouse.buttons();
+        let Some(intent) = mouse.apply(&event) else {
+            return Ok(());
+        };
 
         if self.macos_drag {
             use super::macos_drag::MouseReport;
             let mut state = self.macos_drag_state.lock();
             let extent = self.screen_resolution.read().unwrap_or((1920, 1080));
             let (buttons, reports) = state.plan(event, buttons, extent);
-            self.mouse_buttons.store(buttons, Ordering::Relaxed);
+            debug_assert_eq!(buttons, mouse.buttons());
             for report in reports.iter().copied() {
                 match report {
                     MouseReport::Absolute { buttons, x, y } => {
@@ -887,34 +891,33 @@ impl HidBackend for OtgBackend {
             return Ok(());
         }
 
-        match event.event_type {
-            MouseEventType::Move => {
-                let dx = event.x.clamp(-127, 127) as i8;
-                let dy = event.y.clamp(-127, 127) as i8;
-                self.send_mouse_report_relative(buttons, dx, dy, 0)?;
+        // Device availability and dual-interface policy remain OTG-specific.
+        match intent.kind {
+            IntentKind::RelativeMove => self.send_mouse_report_relative(
+                intent.buttons,
+                intent.relative.0,
+                intent.relative.1,
+                0,
+            )?,
+            IntentKind::AbsoluteMove => {
+                let buttons = if self.mouse_rel_path.is_some() {
+                    0
+                } else {
+                    intent.buttons
+                };
+                self.send_mouse_report_absolute(buttons, intent.absolute.0, intent.absolute.1, 0)?;
             }
-            MouseEventType::MoveAbs => {
-                // Coordinates 0–32767; buttons are sent only on the relative endpoint.
-                let x = event.x.clamp(0, 32767) as u16;
-                let y = event.y.clamp(0, 32767) as u16;
-                self.send_mouse_report_absolute(0, x, y, 0)?;
-            }
-            MouseEventType::Down => {
-                if let Some(button) = event.button {
-                    let bit = button.to_hid_bit();
-                    let new_buttons = self.mouse_buttons.fetch_or(bit, Ordering::Relaxed) | bit;
-                    self.send_mouse_report_relative(new_buttons, 0, 0, 0)?;
+            IntentKind::Buttons | IntentKind::Wheel => {
+                if self.mouse_rel_path.is_some() {
+                    self.send_mouse_report_relative(intent.buttons, 0, 0, intent.wheel)?;
+                } else if self.mouse_abs_path.is_some() {
+                    self.send_mouse_report_absolute(
+                        intent.buttons,
+                        intent.absolute.0,
+                        intent.absolute.1,
+                        intent.wheel,
+                    )?;
                 }
-            }
-            MouseEventType::Up => {
-                if let Some(button) = event.button {
-                    let bit = button.to_hid_bit();
-                    let new_buttons = self.mouse_buttons.fetch_and(!bit, Ordering::Relaxed) & !bit;
-                    self.send_mouse_report_relative(new_buttons, 0, 0, 0)?;
-                }
-            }
-            MouseEventType::Scroll => {
-                self.send_mouse_report_relative(buttons, 0, 0, event.scroll)?;
             }
         }
 
@@ -930,10 +933,17 @@ impl HidBackend for OtgBackend {
             self.send_keyboard_report(&report)?;
         }
 
-        self.mouse_buttons.store(0, Ordering::Relaxed);
+        let mut mouse = self.mouse_state.lock();
+        let release = mouse.release_buttons();
         self.macos_drag_state.lock().reset();
         self.send_mouse_report_relative(0, 0, 0, 0)?;
-        self.send_mouse_report_absolute(0, 0, 0, 0)?;
+        if self.mouse_rel_path.is_none() && self.mouse_abs_path.is_some() {
+            // An absolute-only release must not teleport the pointer to origin.
+            self.send_mouse_report_absolute(0, release.absolute.0, release.absolute.1, 0)?;
+        } else {
+            *mouse = MouseState::default();
+            self.send_mouse_report_absolute(0, 0, 0, 0)?;
+        }
 
         info!("HID state reset");
         Ok(())
@@ -1067,6 +1077,128 @@ mod tests {
     #[test]
     fn compatibility_requires_both_mouse_endpoints() {
         assert!(OtgBackend::with_macos_drag(HidDevicePaths::default(), true).is_err());
+    }
+
+    #[tokio::test]
+    async fn absolute_only_click_wheel_drag_and_reset_keep_position() {
+        use crate::hid::MouseButton;
+        let absolute = tempfile::NamedTempFile::new().unwrap();
+        let backend = OtgBackend::from_handles(HidDevicePaths {
+            mouse_absolute: Some(absolute.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+        for event in [
+            MouseEvent::move_abs(18022, 16384),
+            MouseEvent::move_rel(10, 10), // No relative output exists; no extra report.
+            MouseEvent::button_down(MouseButton::Left),
+            MouseEvent::scroll(-1),
+            MouseEvent::move_abs(8192, 12288),
+            MouseEvent::button_up(MouseButton::Left),
+        ] {
+            backend.send_mouse(event).await.unwrap();
+        }
+        backend.reset().await.unwrap();
+        assert_eq!(
+            fs::read(absolute.path()).unwrap(),
+            [
+                [0, 102, 70, 0, 64, 0],
+                [1, 102, 70, 0, 64, 0],
+                [1, 102, 70, 0, 64, 255],
+                [1, 0, 32, 0, 48, 0],
+                [0, 0, 32, 0, 48, 0],
+                [0, 0, 32, 0, 48, 0],
+            ]
+            .concat()
+        );
+    }
+
+    #[tokio::test]
+    async fn relative_only_ignores_missing_absolute_output_and_preserves_reports() {
+        use crate::hid::MouseButton;
+        let relative = tempfile::NamedTempFile::new().unwrap();
+        let backend = OtgBackend::from_handles(HidDevicePaths {
+            mouse_relative: Some(relative.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+        for event in [
+            MouseEvent::move_abs(10000, 20000),
+            MouseEvent::button_down(MouseButton::Right),
+            MouseEvent::move_rel(200, -200),
+            MouseEvent::scroll(2),
+            MouseEvent::button_up(MouseButton::Right),
+        ] {
+            backend.send_mouse(event).await.unwrap();
+        }
+        backend.reset().await.unwrap();
+        assert_eq!(
+            fs::read(relative.path()).unwrap(),
+            [
+                [2, 0, 0, 0],
+                [2, 127, 129, 0],
+                [2, 0, 0, 2],
+                [0, 0, 0, 0],
+                [0, 0, 0, 0],
+            ]
+            .concat()
+        );
+        let empty = OtgBackend::from_handles(HidDevicePaths::default()).unwrap();
+        empty
+            .send_mouse(MouseEvent::button_down(MouseButton::Left))
+            .await
+            .unwrap();
+        empty.send_mouse(MouseEvent::scroll(1)).await.unwrap();
+        empty.reset().await.unwrap();
+        assert_eq!(empty.mouse_state.lock().buttons(), 0);
+    }
+
+    #[test]
+    fn concurrent_absolute_button_transitions_match_device_write_order() {
+        use crate::hid::MouseButton;
+        let absolute = tempfile::NamedTempFile::new().unwrap();
+        let backend = Arc::new(
+            OtgBackend::from_handles(HidDevicePaths {
+                mouse_absolute: Some(absolute.path().to_path_buf()),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(5));
+        let workers: Vec<_> = [
+            MouseButton::Left,
+            MouseButton::Right,
+            MouseButton::Middle,
+            MouseButton::Back,
+            MouseButton::Forward,
+        ]
+        .into_iter()
+        .map(|button| {
+            let backend = backend.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                barrier.wait();
+                runtime
+                    .block_on(backend.send_mouse(MouseEvent::button_down(button)))
+                    .unwrap();
+            })
+        })
+        .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let reports = fs::read(absolute.path()).unwrap();
+        assert_eq!(reports.len(), 30);
+        let mut previous: u8 = 0;
+        for report in reports.chunks_exact(6) {
+            assert_eq!(report[0] & previous, previous);
+            assert_eq!(report[0].count_ones(), previous.count_ones() + 1);
+            previous = report[0];
+        }
+        assert_eq!(previous, 31);
     }
 
     #[tokio::test]
