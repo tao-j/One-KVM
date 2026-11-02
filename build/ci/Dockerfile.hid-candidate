@@ -1,0 +1,6 @@
+# Retain the audited ARM64 runtime; replace only the compiled application.
+FROM silentwind0/one-kvm@sha256:177818b7e1e72bd6743493e64551d3267341c20cd212b78a1d39a1f38ef32f1d
+ARG SOURCE_REVISION
+LABEL org.opencontainers.image.source="https://github.com/tao-j/One-KVM" \
+      org.opencontainers.image.revision=$SOURCE_REVISION
+COPY --chmod=755 one-kvm /usr/bin/one-kvm

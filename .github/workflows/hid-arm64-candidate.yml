@@ -1,0 +1,109 @@
+name: HID ARM64 candidate
+
+on:
+  pull_request:
+    branches: [stock-v261001]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hid-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hid-tests:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: test/hid-component
+      - run: cargo test --locked --manifest-path test/hid-component/Cargo.toml
+
+  candidate:
+    needs: hid-tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    env:
+      STOCK_IMAGE: silentwind0/one-kvm@sha256:177818b7e1e72bd6743493e64551d3267341c20cd212b78a1d39a1f38ef32f1d
+    steps:
+      - uses: actions/checkout@v4
+      - name: Make room on the disposable hosted runner
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          df -h .
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v3
+      - name: Extract original frontend from isolated stock image
+        run: |
+          docker pull --platform linux/arm64 "$STOCK_IMAGE"
+          docker run -d --platform linux/arm64 --name stock-frontend \
+            --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --tmpfs /tmp --tmpfs /run --tmpfs /etc/one-kvm \
+            -p 127.0.0.1:18081:8080 -e HTTP_PORT=8080 -e BIND_ADDRESS=0.0.0.0 \
+            --entrypoint /usr/bin/one-kvm "$STOCK_IMAGE"
+          python3 build/ci/copy-stock-frontend.py
+          docker rm -f stock-frontend
+      - name: Build cached Debian 12 ARM64 media SDK
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: build/cross/Dockerfile.arm64
+          platforms: linux/amd64
+          load: true
+          tags: one-kvm-arm64-sdk:local
+          cache-from: type=gha,scope=hid-arm64-sdk
+          cache-to: type=gha,scope=hid-arm64-sdk,mode=max
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .ci-cargo-registry
+            .ci-cargo-git
+            target/aarch64-unknown-linux-gnu
+            target/release
+          key: hid-arm64-${{ hashFiles('Cargo.lock', 'build/cross/Dockerfile.arm64') }}-${{ github.sha }}
+          restore-keys: hid-arm64-${{ hashFiles('Cargo.lock', 'build/cross/Dockerfile.arm64') }}-
+      - name: Compile patched application only
+        run: |
+          mkdir -p .ci-cargo-registry .ci-cargo-git
+          docker run --rm -e CARGO_BUILD_JOBS=3 \
+            -v "$PWD:/work" -w /work \
+            -v "$PWD/.ci-cargo-registry:/root/.cargo/registry" \
+            -v "$PWD/.ci-cargo-git:/root/.cargo/git" \
+            one-kvm-arm64-sdk:local \
+            cargo build --locked --release --target aarch64-unknown-linux-gnu --bin one-kvm
+          sudo chown -R "$(id -u):$(id -g)" target .ci-cargo-registry .ci-cargo-git
+          file target/aarch64-unknown-linux-gnu/release/one-kvm
+          sha256sum target/aarch64-unknown-linux-gnu/release/one-kvm > artifacts/binary.sha256
+          git rev-parse HEAD > artifacts/source-revision.txt
+          docker image inspect one-kvm-arm64-sdk:local --format '{{.Id}}' > artifacts/sdk-image-id.txt
+          docker run --rm one-kvm-arm64-sdk:local dpkg-query -W > artifacts/sdk-packages.txt
+      - name: Layer binary onto pinned stock runtime
+        run: |
+          mkdir -p "$RUNNER_TEMP/one-kvm-image"
+          cp target/aarch64-unknown-linux-gnu/release/one-kvm "$RUNNER_TEMP/one-kvm-image/one-kvm"
+          docker buildx build --platform linux/arm64 --load \
+            -f build/ci/Dockerfile.hid-candidate \
+            --build-arg SOURCE_REVISION="$(git rev-parse HEAD)" \
+            -t one-kvm-hid-candidate:arm64 "$RUNNER_TEMP/one-kvm-image"
+          docker run --rm --platform linux/arm64 --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --entrypoint /usr/bin/one-kvm \
+            one-kvm-hid-candidate:arm64 --version
+          docker image inspect one-kvm-hid-candidate:arm64 > artifacts/candidate-image.json
+          docker save one-kvm-hid-candidate:arm64 | zstd -T0 -3 -o artifacts/one-kvm-hid-arm64.tar.zst
+          sha256sum artifacts/one-kvm-hid-arm64.tar.zst > artifacts/image.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: one-kvm-hid-arm64-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove isolated frontend if an earlier step failed
+        if: always()
+        run: docker rm -f stock-frontend 2>/dev/null || true

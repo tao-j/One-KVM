@@ -5,6 +5,7 @@ ARG DEBIAN_IMAGE=debian:12
 FROM ${DEBIAN_IMAGE}
 
 ARG CHINAMIRRO=0
+ARG RUST_TOOLCHAIN=1.99.0
 ARG GH_PROXY=https://gh-proxy.com/
 ARG RUSTUP_DIST_SERVER_CN=https://mirrors.ustc.edu.cn/rust-static
 ARG RUSTUP_UPDATE_ROOT_CN=https://mirrors.ustc.edu.cn/rust-static/rustup
@@ -17,6 +18,9 @@ ARG X265_VERSION=3.4
 ARG OPUS_VERSION=1.5.2
 ARG RKMPP_BRANCH=jellyfin-mpp
 ARG RKRGA_BRANCH=jellyfin-rga
+ARG RKMPP_REV=ca9b2db9bd37f7b77f181bb3601ec71a4a41d330
+ARG RKRGA_REV=1d330cc28551943bed3380261a5a9c6fbd58ff53
+ARG X264_REV=c24e06c2e184345ceb33eb20a15d1024d9fd3497
 ARG FFMPEG_ROCKCHIP_REV=40c412daccf08164493da0de990eb99a8948116b
 
 # Optionally use China mirrors for builds in China.
@@ -34,7 +38,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         export RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER_CN}; \
         export RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT_CN}; \
     fi \
-    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain "${RUST_TOOLCHAIN}" \
     && if [ "$CHINAMIRRO" = "1" ]; then \
         mkdir -p /root/.cargo; \
         printf '%s\n' \
@@ -172,8 +176,11 @@ RUN github_prefix="" \
 # Build static libx264 from source (cross-compile for ARM64)
 RUN github_prefix="" \
     && if [ "$CHINAMIRRO" = "1" ]; then github_prefix="${GH_PROXY%/}/"; fi \
-    && git clone --depth 1 "${github_prefix}https://github.com/mirror/x264.git" /tmp/x264 \
+    && git init /tmp/x264 \
     && cd /tmp/x264 \
+    && git remote add origin "${github_prefix}https://github.com/mirror/x264.git" \
+    && git fetch --depth 1 origin "${X264_REV}" \
+    && git checkout --detach FETCH_HEAD \
     && export CC=aarch64-linux-gnu-gcc \
     && export AR=aarch64-linux-gnu-ar \
     && export RANLIB=aarch64-linux-gnu-ranlib \
@@ -258,8 +265,10 @@ COPY build/cross/patches/0001-v4l2-m2m-reject-undersized-encoder-format.patch /t
 RUN mkdir -p /tmp/ffmpeg-build && cd /tmp/ffmpeg-build \
     && github_prefix="" \
     && if [ "$CHINAMIRRO" = "1" ]; then github_prefix="${GH_PROXY%/}/"; fi \
-    && git clone --depth 1 --branch ${RKMPP_BRANCH} "${github_prefix}https://github.com/nyanmisaka/mpp.git" rkmpp \
-    && git clone --depth 1 --branch ${RKRGA_BRANCH} "${github_prefix}https://github.com/nyanmisaka/rk-mirrors.git" rkrga \
+    && git init rkmpp && git -C rkmpp remote add origin "${github_prefix}https://github.com/nyanmisaka/mpp.git" \
+    && git -C rkmpp fetch --depth 1 origin "${RKMPP_REV}" && git -C rkmpp checkout --detach FETCH_HEAD \
+    && git init rkrga && git -C rkrga remote add origin "${github_prefix}https://github.com/nyanmisaka/rk-mirrors.git" \
+    && git -C rkrga fetch --depth 1 origin "${RKRGA_REV}" && git -C rkrga checkout --detach FETCH_HEAD \
     && git init ffmpeg-rockchip \
     && cd ffmpeg-rockchip \
     && git remote add origin "${github_prefix}https://github.com/nyanmisaka/ffmpeg-rockchip.git" \
