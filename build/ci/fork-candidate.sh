@@ -13,7 +13,9 @@ sdk=(docker run --rm -e CARGO_BUILD_JOBS=3 -v "$PWD:/work" -w /work
   -v "$PWD/.ci-cargo-git:/root/.cargo/git" one-kvm-sdk:local)
 "${sdk[@]}" cargo build --locked --release --target "$TARGET" --bin one-kvm "${features[@]}"
 if [[ "$ARCH" == amd64 ]]; then
-  "${sdk[@]}" cargo test --locked --release --target "$TARGET" --bin one-kvm hid::
+  "${sdk[@]}" cargo test --locked --release --target "$TARGET" --lib hid:: | tee artifacts/hid-tests.txt
+  # A valid command with the wrong target/filter can silently execute zero tests.
+  grep -Eq "test result: ok\. [1-9][0-9]* passed" artifacts/hid-tests.txt
 fi
 sudo chown -R "$(id -u):$(id -g)" target .ci-cargo-registry .ci-cargo-git
 bash build/package-docker.sh --platform "linux/$ARCH" --image-name one-kvm-candidate --tag "$ARCH" --load
