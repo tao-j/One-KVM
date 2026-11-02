@@ -1,0 +1,21 @@
+name: HID tests
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  hid:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            test/hid-component
+            test/hid-queue
+            test/hid-session
+      - run: cargo test --locked --manifest-path test/hid-component/Cargo.toml
+      - run: cargo test --locked --manifest-path test/hid-queue/Cargo.toml
+      - run: cargo test --locked --manifest-path test/hid-session/Cargo.toml
